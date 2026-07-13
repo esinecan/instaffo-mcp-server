@@ -1,0 +1,23 @@
+# Session material and secrets — NEVER commit. These hold a live Instaffo login.
+.env
+.instaffo-mcp/
+storage-state.json
+cookies.json
+captures/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

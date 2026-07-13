@@ -1,0 +1,38 @@
+[project]
+name = "instaffo-mcp-server"
+version = "0.1.0"
+description = "MCP server that gives an AI assistant access to a candidate's own Instaffo account through the candidate's own browser session."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+authors = [{ name = "Eren Can Sinecan" }]
+license = "MIT"
+keywords = ["mcp", "model-context-protocol", "instaffo", "job-search"]
+dependencies = [
+    "fastmcp>=3.0.0",
+    "patchright>=1.40.0",
+    "python-dotenv>=1.1.1",
+    # Present for the deferred JSON-replay client; unused until the API fork is
+    # confirmed by the capture harness (see README, "The one open question").
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+instaffo-mcp = "instaffo_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/esinecan/instaffo-mcp-server"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["instaffo_mcp*"]
+exclude = ["tests*", "captures*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.11.11",
+]
