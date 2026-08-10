@@ -20,6 +20,13 @@ from typing import Any
 import httpx
 
 from instaffo_mcp.config import Config, get_config
+from instaffo_mcp.errors import (
+    AUTH_EXPIRED,
+    BLOCKED,
+    ToolError,
+    classify_body,
+    classify_status,
+)
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -28,8 +35,16 @@ _UA = (
 API = "/candidate/api/v1"
 
 
-class InstaffoAuthError(RuntimeError):
-    """The stored session is missing or no longer accepted by Instaffo."""
+class InstaffoAuthError(ToolError):
+    """The stored session is missing or no longer accepted by Instaffo.
+
+    A ``ToolError`` of kind ``auth_expired``, so it carries an envelope and an
+    exit code like every other failure. Kept as a named subclass because the
+    "no session on disk" case is worth catching specifically.
+    """
+
+    def __init__(self, message: str, **detail: Any) -> None:
+        super().__init__(AUTH_EXPIRED, message, **detail)
 
 
 class InstaffoClient:
@@ -43,7 +58,15 @@ class InstaffoClient:
             follow_redirects=False,
             headers={
                 "User-Agent": _UA,
-                "Accept": "application/json, text/plain, */*",
+                # STRICT on purpose. Verified 2026-08-10 (docs/API.md PASS 2):
+                # the Accept header decides what a dead session looks like.
+                #   application/json                    -> 403 JSON, classifiable
+                #   application/json, text/plain, */*   -> 302, and if followed,
+                #                                          200 + an HTML login page
+                # The browser-ish value is what the SPA sends and it is what this
+                # client used to send; combined with follow_redirects=True it turns
+                # every expired session into an HTTP 200. Do not widen this.
+                "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": f"{self.cfg.app_origin}/candidate/job_suggestions/",
                 "Cookie": cookie,
@@ -86,15 +109,53 @@ class InstaffoClient:
 
     # -- transport ---------------------------------------------------------
     def _guard(self, r: httpx.Response) -> httpx.Response:
-        loc = r.headers.get("location", "")
-        if r.status_code in (401, 403) or (
-            r.status_code in (301, 302, 303, 307, 308) and "/signin" in loc
-        ):
-            raise InstaffoAuthError(
-                "Instaffo session expired or rejected. Run `instaffo-mcp --login`."
+        """The single classification choke point for this repo.
+
+        Everything that reaches a tool has passed through here, so no other
+        module needs to know the taxonomy.
+        """
+        body = ""
+        try:
+            body = r.text
+        except Exception:  # pragma: no cover - body already consumed/binary
+            pass
+
+        # Choke point 2 first: a 2xx can still be a failure (HTML login page).
+        inband = classify_body(r.status_code, r.headers.get("content-type", ""), body)
+        if inband is not None:
+            raise ToolError(
+                inband,
+                "Instaffo returned an HTML page where JSON was expected — the "
+                "session is almost certainly gone. Run `instaffo-mcp --login`.",
+                status=r.status_code,
+                url=str(r.request.url),
             )
-        r.raise_for_status()
-        return r
+
+        if 200 <= r.status_code < 300:
+            return r
+
+        # Choke point 1: the status table.
+        kind = classify_status(r.status_code, body)
+        detail: dict[str, Any] = {"status": r.status_code, "url": str(r.request.url)}
+        loc = r.headers.get("location", "")
+        if loc:
+            detail["location"] = loc
+        # Instaffo puts its reason in {"errors": {...}} on every 4xx.
+        try:
+            errs = r.json().get("errors")
+            if errs:
+                detail["errors"] = errs
+        except Exception:
+            if body:
+                detail["body"] = body[:300]
+
+        if kind == AUTH_EXPIRED:
+            msg = "Instaffo session expired or rejected. Run `instaffo-mcp --login`."
+        elif kind == BLOCKED:
+            msg = "Instaffo served an anti-bot challenge."
+        else:
+            msg = f"Instaffo returned {r.status_code}."
+        raise ToolError(kind, msg, **detail)
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._guard(self._http.get(path, params=params)).json()
@@ -105,6 +166,24 @@ class InstaffoClient:
         if token:
             headers["X-CSRF-Token"] = token
         r = self._guard(self._http.post(path, json=body or {}, headers=headers))
+        if not r.content:
+            return {"status": r.status_code}
+        try:
+            return r.json()
+        except ValueError:
+            return {"status": r.status_code, "text": r.text[:500]}
+
+    def patch(self, path: str, body: dict[str, Any] | None = None) -> Any:
+        """PATCH. The ``/candidate/api/v1/factors/*`` endpoints require it.
+
+        Observed 2026-08-10: salary, job_roles and job_seeking_activity are all
+        PATCH, while every ``/profile/*`` section is POST. See docs/API.md.
+        """
+        headers = {}
+        token = self._csrf_token()
+        if token:
+            headers["X-CSRF-Token"] = token
+        r = self._guard(self._http.request("PATCH", path, json=body or {}, headers=headers))
         if not r.content:
             return {"status": r.status_code}
         try:

@@ -56,17 +56,46 @@ Reads (no side effects):
 | `instaffo_get_job_suggestion` | one role in full: description, requirements, salary, screening questions |
 | `instaffo_list_conversations` | company requests (inbound interest) and your applications |
 | `instaffo_auth_status` | is a session present (`--deep` validates it live) |
+| `instaffo_search_skills` | look up skill uuids in Instaffo's closed vocabulary |
 
-Writes (every write tool takes `confirm`; without it you get a preview and
-nothing changes):
+Writes (every write tool takes `confirm`; without it **no network call is made**
+and you get back the exact payload that would be sent):
 
 | Tool | Effect | Endpoint |
 |---|---|---|
-| `instaffo_save_job` | bookmark a suggestion (reversible) | `POST .../job_suggestions/{uuid}/favorite` |
-| `instaffo_unsave_job` | remove a bookmark | `DELETE .../job_suggestions/{uuid}/favorite` |
-| `instaffo_set_skill_experience` | set your years per skill on your profile | `POST .../experience_durations/bulk_save` |
+| `instaffo_save_job` / `instaffo_unsave_job` | bookmark a suggestion | `POST\|DELETE .../job_suggestions/{uuid}/favorite` |
+| `instaffo_set_about` | replace the About me text | `POST .../profile/about` |
+| `instaffo_set_skills` | replace the skill set | `POST .../profile/skills` |
+| `instaffo_set_languages` | replace the language list | `POST .../profile/languages` |
+| `instaffo_set_industries` | replace industry experience | `POST .../profile/industries` |
+| `instaffo_set_links` | replace social links | `POST .../profile/links` |
+| `instaffo_set_seniority` | set working experience level | `POST .../profile/professional_background` |
+| `instaffo_set_salary` | annual salary expectation | `PATCH .../factors/salary` |
+| `instaffo_set_job_roles` | target roles (drives matching) | `PATCH .../factors/job_roles` |
+| `instaffo_set_job_seeking_activity` | active / passive | `PATCH .../factors/job_seeking_activity` |
+| `instaffo_add_cv_station` | add a work or education entry | `POST .../cv` |
+| `instaffo_update_cv_station` | edit an entry in place | `PATCH .../cv/{uuid}` |
+| `instaffo_delete_cv_station` | remove an entry (irreversible) | `DELETE .../cv/{uuid}` |
+| `instaffo_set_skill_experience` | years per skill | `POST .../experience_durations/bulk_save` |
 
-All endpoints above are verified against the live API.
+All endpoints are observed, never guessed. The contract they were built from is
+[`docs/API.md`](docs/API.md), dated and derived from a recorded capture.
+
+### Why every write reads back
+
+This API returns a bare `{"success": true}` for **every** write, and validates
+only partially — a `PATCH` with required fields omitted, or with wrong-typed
+values, also returns `{"success": true}`. The response therefore cannot tell you
+what was stored. Each write tool re-reads `GET /profile` and reports `verified`
+plus `value_now`; trust those, not the response.
+
+Two field traps worth knowing before you call anything:
+
+- **`instaffo_set_skills` re-derives `topSkills` server-side.** There is no
+  `topSkills` field to send and no UI control for it. A save with the skill set
+  unchanged still moved the top three.
+- **Skills cap at 23** (`skills` 20 + `topSkills` 3). Exceeding it returns
+  `"maximum is 20 characters"` — the message says characters, the unit is items.
 
 ## Supervised, on purpose: apply and message
 

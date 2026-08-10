@@ -6,6 +6,12 @@ cookies.json
 captures/
 *.jsonl
 
+# Capture fixtures hold the account owner's real profile: CV text, phone, email,
+# work history. The contract (docs/API.md) is public; the bodies it was derived
+# from are not. Keep them local.
+docs/fixtures/
+recon/*/fixtures/
+
 # Python
 __pycache__/
 *.py[cod]

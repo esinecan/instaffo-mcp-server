@@ -25,6 +25,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="instaffo-mcp")
     parser.add_argument("--login", action="store_true", help="Headed manual login.")
     parser.add_argument("--capture", action="store_true", help="Record API traffic.")
+    parser.add_argument(
+        "--fixtures",
+        metavar="DIR",
+        help="With --capture: write byte-exact request/response fixtures to DIR.",
+    )
+    parser.add_argument(
+        "--case",
+        default="happy",
+        choices=["happy", "bad-id", "empty", "unauth", "overflow", "stale-token"],
+        help="With --fixtures: the case label baked into fixture filenames.",
+    )
     parser.add_argument("--auth-status", action="store_true", help="Report session state.")
     parser.add_argument("--deep", action="store_true", help="With --auth-status: validate live.")
     parser.add_argument("--log-level", default="INFO")
@@ -39,13 +50,22 @@ def main() -> None:
         raise SystemExit(0 if ok else 1)
 
     if args.capture:
+        from pathlib import Path
+
         from instaffo_mcp.driver import capture_api_traffic
 
-        out = asyncio.run(capture_api_traffic())
+        fixtures = Path(args.fixtures).expanduser() if args.fixtures else None
+        out = asyncio.run(
+            capture_api_traffic(fixtures_dir=fixtures, case=args.case)
+        )
         print(f"\n  Capture written to: {out}")
-        print("  Inspect it to decide the fork: are the app's data calls JSON")
-        print("  (content_type application/json) and do they carry Authorization")
-        print("  or just Cookie? That answers scrape-vs-replay.\n")
+        if fixtures:
+            print(f"  Fixtures written to: {fixtures}")
+            print("  Check index.jsonl, then drill the bodies for the contract.\n")
+        else:
+            print("  Inspect it to decide the fork: are the app's data calls JSON")
+            print("  (content_type application/json) and do they carry Authorization")
+            print("  or just Cookie? That answers scrape-vs-replay.\n")
         return
 
     if args.auth_status:

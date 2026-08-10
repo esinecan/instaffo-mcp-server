@@ -19,9 +19,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from patchright.async_api import BrowserContext, async_playwright
 
@@ -115,21 +117,116 @@ async def deep_auth_check(cfg: Config | None = None) -> dict[str, Any]:
         await pw.stop()
 
 
-async def capture_api_traffic(cfg: Config | None = None) -> Path:
+_REDACT_HEADERS = {
+    "cookie",
+    "set-cookie",
+    "authorization",
+    "x-csrf-token",
+    "x-xsrf-token",
+}
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
+
+
+def _redact(headers: dict[str, str]) -> dict[str, str]:
+    """Keep header *names* (auth-vs-telemetry needs them); drop secret values."""
+    return {
+        k: (f"<redacted {len(v)} chars>" if k.lower() in _REDACT_HEADERS else v)
+        for k, v in headers.items()
+    }
+
+
+def _slug(method: str, url: str) -> str:
+    """Stable fixture basename: uuids and numeric ids collapse to placeholders."""
+    path = urlparse(url).path.strip("/")
+    path = path.replace("candidate/api/v1/", "")
+    path = _UUID_RE.sub("uuid", path)
+    path = re.sub(r"/\d+(?=/|$)", "/id", path)
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", path).strip("-").lower()
+    return f"{method.lower()}-{slug}"[:70] if slug else method.lower()
+
+
+_TELEMETRY_HOSTS = (
+    "plausible.io",
+    "sentry.io",
+    "segment.",
+    "datadoghq.",
+    "amplitude.",
+    "google-analytics.",
+    "googletagmanager.",
+    "hotjar.",
+    "intercom.",
+)
+_TELEMETRY_PATHS = ("/event", "/collect", "/track", "/beacon", "/envelope")
+
+
+def _is_contract_traffic(url: str, app_origin: str) -> bool:
+    """Keep the site's own API; drop telemetry.
+
+    The skill's filter-validation rule: a non-empty result is not a working
+    filter. Third-party beacons match ``/api/`` too (plausible ``/api/event``,
+    sentry ``/api/<id>/envelope/``), and Instaffo fires its own ``/api/v1/event``
+    beacon. Host-scope first, then drop beacon paths.
+    """
+    u = urlparse(url)
+    if u.netloc != urlparse(app_origin).netloc:
+        return False
+    if any(h in u.netloc for h in _TELEMETRY_HOSTS):
+        return False
+    return not any(u.path.rstrip("/").endswith(p) for p in _TELEMETRY_PATHS)
+
+
+def _ext_for(content_type: str) -> str:
+    """Extension tells the truth about framing (skill: wire format section)."""
+    ct = (content_type or "").lower()
+    if "json" in ct:
+        return "json"
+    if "html" in ct:
+        return "html"
+    return "txt"
+
+
+async def capture_api_traffic(
+    cfg: Config | None = None,
+    *,
+    fixtures_dir: Path | None = None,
+    case: str = "happy",
+) -> Path:
     """Record XHR/fetch traffic while the human clicks around the app.
 
-    This is the inspection instrument. It logs, per request, the method, URL,
-    resource type, and whether an ``Authorization`` header and/or ``Cookie`` was
-    sent (the scrape-vs-API tell), plus a short post-body sample; and per
-    response, the status and content-type (does the endpoint return JSON?).
-    Values of cookies and tokens are never recorded.
+    Two instruments in one, chosen by ``fixtures_dir``:
+
+    - ``fixtures_dir=None`` (default) — the original diagnostic. Per request:
+      method, URL, whether ``Authorization`` and/or ``Cookie`` was sent (the
+      scrape-vs-API tell) and a short post-body sample; per response: status and
+      content-type. Enough to decide the fork, not enough to build against.
+    - ``fixtures_dir=<path>`` — contract-grade capture. Full request headers and
+      body, full response headers and body, written byte-exact to
+      ``<fixtures_dir>/<method>-<path>-<case>.<ext>``. This is what
+      site-as-tool construction consumes.
+
+    Secret header *values* (cookie, authorization, csrf) are redacted in both
+    modes; the header names survive, because separating auth from telemetry
+    needs the name list.
     """
     cfg = cfg or get_config()
     cfg.captures_dir.mkdir(parents=True, exist_ok=True)
     out_path = cfg.captures_dir / f"capture-{int(time.time())}.jsonl"
+    if fixtures_dir is not None:
+        fixtures_dir = Path(fixtures_dir)
+        fixtures_dir.mkdir(parents=True, exist_ok=True)
 
     pw, context = await _launch(cfg, headless=False)
     records: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+
+    def _fixture_path(method: str, url: str, part: str, ext: str) -> Path:
+        base = _slug(method, url)
+        n = seen.get(base, 0)
+        suffix = "" if n <= 1 else f"-{n}"
+        name = f"{base}-{case}{suffix}{'-request' if part == 'request' else ''}.{ext}"
+        return fixtures_dir / name  # type: ignore[union-attr]
 
     def on_request(request: Any) -> None:
         if request.resource_type not in ("xhr", "fetch"):
@@ -147,18 +244,41 @@ async def capture_api_traffic(cfg: Config | None = None) -> Path:
             }
         )
 
-    def on_response(response: Any) -> None:
+    async def on_response(response: Any) -> None:
         req = response.request
         if req.resource_type not in ("xhr", "fetch"):
             return
-        records.append(
-            {
-                "kind": "response",
-                "url": response.url,
-                "status": response.status,
-                "content_type": response.headers.get("content-type", ""),
-            }
-        )
+        content_type = response.headers.get("content-type", "")
+        rec: dict[str, Any] = {
+            "kind": "response",
+            "url": response.url,
+            "status": response.status,
+            "content_type": content_type,
+        }
+        if fixtures_dir is not None and _is_contract_traffic(
+            response.url, cfg.app_origin
+        ):
+            base = _slug(req.method, response.url)
+            seen[base] = seen.get(base, 0) + 1
+            rec["request_headers"] = _redact(await req.all_headers())
+            rec["response_headers"] = _redact(await response.all_headers())
+            body = req.post_data
+            if body:
+                p = _fixture_path(req.method, response.url, "request", "json")
+                p.write_text(body, encoding="utf-8")
+                rec["request_fixture"] = p.name
+            try:
+                raw = await response.body()
+            except Exception as exc:  # discarded, redirect, or no body
+                rec["response_body_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                p = _fixture_path(
+                    req.method, response.url, "response", _ext_for(content_type)
+                )
+                p.write_bytes(raw)
+                rec["response_fixture"] = p.name
+                rec["response_bytes"] = len(raw)
+        records.append(rec)
 
     context.on("request", on_request)
     context.on("response", on_response)
@@ -167,11 +287,18 @@ async def capture_api_traffic(cfg: Config | None = None) -> Path:
         page = context.pages[0] if context.pages else await context.new_page()
         target = cfg.app_origin if _has_session(cfg) else cfg.signin_url
         await page.goto(target, wait_until="domcontentloaded")
-        print(
-            "\n  Capturing Instaffo API traffic.\n"
-            "  Sign in if needed, then open your matches, a job, and a chat.\n"
-            "  CLOSE THE BROWSER WINDOW when done to finish the capture.\n"
-        )
+        if fixtures_dir is None:
+            print(
+                "\n  Capturing Instaffo API traffic.\n"
+                "  Sign in if needed, then open your matches, a job, and a chat.\n"
+                "  CLOSE THE BROWSER WINDOW when done to finish the capture.\n"
+            )
+        else:
+            print(
+                f"\n  Contract capture (case={case}) -> {fixtures_dir}\n"
+                "  Perform ONE intent, changing ONE variable, then close the window.\n"
+                "  CLOSE THE BROWSER WINDOW when done to finish the capture.\n"
+            )
         # Run until the human closes the window (no stdin needed, so this works
         # when launched in the background), capped by the login timeout.
         deadline = time.monotonic() + cfg.login_timeout_min * 60
@@ -191,6 +318,9 @@ async def capture_api_traffic(cfg: Config | None = None) -> Path:
                     pass
             await asyncio.sleep(1)
     finally:
+        # Response handlers are coroutines; give in-flight body reads a moment
+        # to land before the context goes away and they start throwing.
+        await asyncio.sleep(1.5)
         for event, handler in (("request", on_request), ("response", on_response)):
             try:
                 context.remove_listener(event, handler)
@@ -204,6 +334,25 @@ async def capture_api_traffic(cfg: Config | None = None) -> Path:
 
     out_path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
     logger.info("Wrote %d traffic records to %s", len(records), out_path)
+
+    if fixtures_dir is not None:
+        index = fixtures_dir / "index.jsonl"
+        api = [
+            r
+            for r in records
+            if r.get("kind") == "response"
+            and _is_contract_traffic(r.get("url", ""), cfg.app_origin)
+        ]
+        with index.open("a", encoding="utf-8") as fh:
+            for r in api:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        written = sum(1 for r in api if r.get("response_fixture"))
+        logger.info(
+            "Contract capture: %d API responses, %d fixtures -> %s",
+            len(api),
+            written,
+            fixtures_dir,
+        )
     return out_path
 
 
