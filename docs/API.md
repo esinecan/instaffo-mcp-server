@@ -146,7 +146,7 @@ end of a multi-step flow. Unchanged by this capture.
 |---|---|---|
 | GET | `/candidate/api/v1/me` | 1317 B; identity |
 | GET | `/candidate/api/v1/profile` | 9942 B; `candidate` object, 49 fields. Baseline fixture is the restore point for PASS 1. |
-| GET | `/candidate/api/v1/job_suggestions` | matches |
+| POST | `/candidate/api/v1/job_suggestions` | listing — **the UI POSTs a filter body**; a plain GET (and a POST with no location filter) returns only the location-matching *preferred* subset, not all open. See finding 3, corrected 2026-08-10. |
 | GET | `/candidate/api/v1/job_suggestions/counters` | counters |
 | GET | `/candidate/api/v1/job_suggestions/{uuid}` | one role |
 | GET | `/candidate/api/v1/job_suggestions/requests` | inbound interest |
@@ -406,16 +406,44 @@ with the write endpoints' uniform 16-byte `{"success":true}`, this means:
 > re-`GET /candidate/api/v1/profile` and compare the field it just wrote. That
 > read-back is the only honest basis for a success message.
 
-**3. `page` is decorative; pagination is cursor-based.**
+**3. Listing is a POST with a filter body; the GET returns only the *preferred*
+slice; pagination is a cursor. (CORRECTED 2026-08-10 — this is the fix for the
+"only 2 of 6 shown" bug.)**
 
-`meta.page` **echoes whatever you send** — `page=9999` returns `meta.page: 9999`
-alongside the very same two rows, and `totalPages` is always `null`. A tool that
-paginates by incrementing `page` will loop forever over page one while `meta`
-confirms the page number back to it. Real pagination is an Elasticsearch
-point-in-time cursor: `meta.searchAfter` (array) plus `meta.pitId`. Any `query`
-parameter is likewise ignored — the endpoint has no server-side search, so a
-nonsense term returns the full unfiltered list rather than an empty one.
-**Do not expose `page` or `query` parameters for `/job_suggestions`.**
+The first capture recorded `GET /job_suggestions` returning "matches" and stopped
+there. That GET (and a POST filtered on `jobStatus:open` alone) returns **only the
+2 suggestions that match the candidate's *preferred* location** — never the full
+open set. The counters say `open.total: 6, open.preferred: 2`; the missing 4 are
+open suggestions in *non-preferred* locations, and they are reachable only by the
+POST the SPA actually fires:
+
+- **Preferred bucket (location matches):** `POST /candidate/api/v1/job_suggestions`
+  body `{"filters":{"jobStatus":"open"},"perPage":N}` → the 2. The server applies
+  the candidate's preferred-location filter implicitly even when no
+  `locationFactors` is sent.
+- **Everything else:** the same POST with the location wrapped in `neg_filters`.
+  The in-app view issues the positive query **and** a `neg_filters` query and
+  concatenates them. Negating an *impossible* location returns the whole open set
+  in one call:
+  `{"filters":{"jobStatus":"open","neg_filters":{"locationFactors":{"value":"specific","cities":[{"city":"Nowhereville","country":"Nowhere","geo":{"lat":0,"lon":0}}]}}},"perPage":N}`
+  → all 6. **Caveat:** in that neg-filtered response the per-row `preferred` flag
+  reads `true` for every row — it is **query-relative, not a stable property**. To
+  label rows correctly, take the true preferred set from the positive query and
+  merge: `preferred = uuid ∈ preferred_set`.
+- **Pagination is an Elasticsearch cursor, not `page`.** `meta.page` **echoes
+  whatever you send** (`page=9999` → `meta.page: 9999`, same rows) and `totalPages`
+  is always `null`. Real paging: pass `meta.searchAfter` (array) back in the POST
+  body as `searchAfter`; a page shorter than `perPage`, an empty page, or a
+  repeated cursor is the end. (`pitId` is echoed too but is not required — the
+  `searchAfter` array alone advances the cursor. Snake-case `search_after[]` as a
+  query param is also honoured but empties the default query; the body `searchAfter`
+  on the POST is the shape the UI uses.)
+- **No server-side text search.** A `query` param is ignored; a nonsense term
+  returns the full list, not an empty one. Do not expose `page` or `query`.
+
+The shipped `instaffo_list_job_suggestions` implements this: paginate the
+neg-impossible query for the full set, paginate the positive query for the
+preferred uuids, merge, list preferred first.
 
 ### Auth model, corrected
 

@@ -58,6 +58,51 @@ def _work_mode(job: dict[str, Any]) -> str:
     return "unspecified"
 
 
+# Listing job suggestions is a POST, not a GET. Verified 2026-08-10 (docs/API.md):
+# GET /job_suggestions returns only the ranked *preferred* slice (jobs matching the
+# candidate's preferred location) — 2 rows even when 6 are open. The in-app view
+# POSTs a filter body and concatenates two result sets: the location-matching
+# "preferred" ones, and the rest fetched via a neg_filters query. Negating an
+# impossible location in one call returns the whole open set; the per-row
+# ``preferred`` flag is query-relative there (reads True for all), so the real
+# preferred set is taken from the default positive query and merged back in.
+_IMPOSSIBLE_LOCATION = {
+    "value": "specific",
+    "cities": [
+        {"city": "Nowhereville", "country": "Nowhere", "geo": {"lat": 0.0, "lon": 0.0}}
+    ],
+}
+_PER_PAGE = 50
+_MAX_PAGES = 20  # backstop; the cursor stops itself when a short page arrives.
+
+
+def _paginate_suggestions(
+    c: InstaffoClient, filters: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Walk the ``searchAfter`` cursor until the result set is exhausted.
+
+    Instaffo paginates job suggestions with Elasticsearch ``search_after`` (the
+    ``meta.searchAfter`` array), not ``page``/``per_page`` — those are ignored.
+    Each page echoes the next cursor; a page shorter than ``perPage`` (or a
+    repeated cursor) is the end.
+    """
+    rows: list[dict[str, Any]] = []
+    search_after: Any = None
+    for _ in range(_MAX_PAGES):
+        body: dict[str, Any] = {"filters": filters, "perPage": _PER_PAGE}
+        if search_after is not None:
+            body["searchAfter"] = search_after
+        data = c.post("/candidate/api/v1/job_suggestions", body)
+        batch = data.get("jobSuggestions", []) if isinstance(data, dict) else []
+        rows.extend(batch)
+        meta = data.get("meta", {}) if isinstance(data, dict) else {}
+        next_after = meta.get("searchAfter")
+        if len(batch) < _PER_PAGE or not next_after or next_after == search_after:
+            break
+        search_after = next_after
+    return rows
+
+
 def _suggestion_row(s: dict[str, Any]) -> dict[str, Any]:
     job = s.get("job", {})
     return {
@@ -132,14 +177,39 @@ def register_read_tools(mcp: FastMCP) -> None:
         tags={"read"},
     )
     async def instaffo_list_job_suggestions() -> dict[str, Any]:
-        """List the candidate's current job suggestions (the matches shown in-app)."""
+        """List ALL of the candidate's open job suggestions (the matches shown in-app).
+
+        Returns every open suggestion, not just the location-matching "preferred"
+        subset. ``preferred`` on each row means the job matches the candidate's
+        preferred location; preferred rows are listed first.
+        """
         try:
             with InstaffoClient() as c:
-                data = c.get("/candidate/api/v1/job_suggestions")
+                all_rows = _paginate_suggestions(
+                    c,
+                    {
+                        "jobStatus": "open",
+                        "neg_filters": {"locationFactors": _IMPOSSIBLE_LOCATION},
+                    },
+                )
+                preferred_rows = _paginate_suggestions(c, {"jobStatus": "open"})
                 counters = c.get("/candidate/api/v1/job_suggestions/counters")
         except InstaffoAuthError as e:
             return {"error": "auth", "detail": str(e)}
-        rows = [_suggestion_row(s) for s in data.get("jobSuggestions", [])]
+        preferred_uuids = {
+            (s.get("job") or {}).get("uuid") for s in preferred_rows
+        }
+        seen: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for s in all_rows:
+            row = _suggestion_row(s)
+            uuid = row["job_uuid"]
+            if not uuid or uuid in seen:
+                continue
+            seen.add(uuid)
+            row["preferred"] = uuid in preferred_uuids
+            rows.append(row)
+        rows.sort(key=lambda r: not r["preferred"])  # preferred first, stable
         return {"counters": counters.get("counters"), "suggestions": rows}
 
     @mcp.tool(
